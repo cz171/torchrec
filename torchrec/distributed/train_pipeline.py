@@ -498,7 +498,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
                 m.forward = lambda x: x
 
     def _connect(self, dataloader_iter: Iterator[In]) -> None:
-        self._replace_fp_forward(cast(torch.nn.Module, self._model.module))
+        self._replace_fp_forward(cast(torch.nn.Module, self._model))
         # batch 1
         with torch.cuda.stream(self._memcpy_stream):
             batch_i = next(dataloader_iter)
