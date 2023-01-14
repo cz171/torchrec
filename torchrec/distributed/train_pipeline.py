@@ -14,6 +14,7 @@ from typing import (
     Dict,
     Generic,
     Iterator,
+    Iterable,
     List,
     Optional,
     Set,
@@ -68,7 +69,7 @@ def _wait_for_batch(batch: In, stream: Optional[torch.cuda.streams.Stream]) -> N
     batch.record_stream(cur_stream)
 
 
-class TrainPipelineBase(TrainPipeline[In, Out]):
+class TrainPipelineBase(TrainPipeline[In, Out], Iterable[Out]):
     """
     This class runs training iterations using a pipeline of two stages, each as a CUDA
     stream, namely, the current (default) stream and `self._memcpy_stream`. For each
@@ -81,10 +82,12 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        dataloader_iter: Iterator[In] = None,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
         self._device = device
+        self._dataloader_iter = dataloader_iter
         self._memcpy_stream: Optional[torch.cuda.streams.Stream] = (
             torch.cuda.Stream() if device.type == "cuda" else None
         )
@@ -99,12 +102,19 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
         self._connected = True
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        self._dataloader_iter = dataloader_iter
+        return self.__next__()
+
+    def __iter__(self) -> Iterator[Out]:
+        return self
+
+    def __next__(self) -> Out:
         if not self._connected:
-            self._connect(dataloader_iter)
+            self._connect(self._dataloader_iter)
 
         # Fetch next batch
         with record_function("## next_batch ##"):
-            next_batch = next(dataloader_iter)
+            next_batch = next(self._dataloader_iter)
         cur_batch = self._cur_batch
         assert cur_batch is not None
 
@@ -134,7 +144,6 @@ class TrainPipelineBase(TrainPipeline[In, Out]):
                 self._optimizer.step()
 
         return output
-
 
 class Tracer(torch.fx.Tracer):
     # Disable proxying buffers during tracing. Ideally, proxying buffers would
@@ -468,10 +477,12 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         model: torch.nn.Module,
         optimizer: torch.optim.Optimizer,
         device: torch.device,
+        dataloader_iter: Iterator[In] = None,
     ) -> None:
         self._model = model
         self._optimizer = optimizer
         self._device = device
+        self._dataloader_iter = dataloader_iter
         # use two data streams to support two concurrent batches
         if device.type == "cuda":
             self._memcpy_stream: Optional[
@@ -524,8 +535,15 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
         self.__class__.synced_pipeline_id[id(self._model)] = id(self)
 
     def progress(self, dataloader_iter: Iterator[In]) -> Out:
+        self._dataloader_iter = dataloader_iter
+        return self.__next__()
+
+    def __iter__(self) -> Iterator[Out]:
+        return self
+
+    def __next__(self) -> Out:
         if not self._connected:
-            self._connect(dataloader_iter)
+            self._connect(self._dataloader_iter)
         elif self.__class__.synced_pipeline_id.get(id(self._model), None) != id(self):
             self._sync_pipeline()
             self.__class__.synced_pipeline_id[id(self._model)] = id(self)
@@ -536,7 +554,7 @@ class TrainPipelineSparseDist(TrainPipeline[In, Out]):
 
         with record_function("## copy_batch_to_gpu ##"):
             with torch.cuda.stream(self._memcpy_stream):
-                batch_ip2 = next(dataloader_iter)
+                batch_ip2 = next(self._dataloader_iter)
                 self._batch_ip2 = batch_ip2 = _to_device(
                     batch_ip2, self._device, non_blocking=True
                 )
